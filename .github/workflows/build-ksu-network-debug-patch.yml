@@ -1,0 +1,27 @@
+name: Build KernelSU Network Debug Patch
+
+on:
+  push:
+    branches:
+      - ksu-network-debug-module
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package module
+        run: |
+          cd ksu-network-debug-module
+          chmod +x customize.sh service.sh uninstall.sh payload/*.sh
+          zip -r ../Box-Network-Debug-Patch-KernelSU.zip . -x 'backup/*'
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Box-Network-Debug-Patch-KernelSU
+          path: Box-Network-Debug-Patch-KernelSU.zip
+          if-no-files-found: error
