@@ -1,0 +1,89 @@
+#!/system/bin/sh
+
+export PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH:/system/bin"
+
+scripts_dir="${0%/*}"
+run_dir="/data/adb/box/run"
+settings="/data/adb/box/settings.ini"
+state_file="${run_dir}/network.state"
+lock_dir="${run_dir}/network-recovery.lock"
+log_file="${run_dir}/network-watchdog.log"
+
+[ -f "$settings" ] || exit 0
+source "$settings"
+
+network_signature() {
+  {
+    ip -4 route show default 2>/dev/null
+    ip -4 route get 1.1.1.1 2>/dev/null
+    ip -4 addr show scope global 2>/dev/null
+  } | busybox sed '/^$/d' | busybox sha256sum | busybox awk '{print $1}'
+}
+
+tun_alive() {
+  case "${network_mode}" in
+    tun|mixed)
+      case "${bin_name}" in
+        clash)
+          device=$(busybox awk '!/^ *#/ && /device: / {print $2; found=1; exit} END{if(!found) print "meta"}' "${clash_config}" 2>/dev/null)
+          busybox ifconfig "${device:-meta}" >/dev/null 2>&1
+          ;;
+        sing-box)
+          device=$(find "${box_dir}/sing-box/" -maxdepth 1 -type f -name '*.json' -exec busybox grep -oE '"interface_name": "[^"]*' {} + 2>/dev/null | busybox awk -F'"' '{print $4}' | head -n 1)
+          busybox ifconfig "${device:-tun0}" >/dev/null 2>&1
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+recover() {
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "$(date): network change detected, restarting proxy service" >> "$log_file"
+  sleep 2
+
+  # Restart uses the project's existing lifecycle path.  It disables the old
+  # interception state, starts the core again, then renews interception rules.
+  "${scripts_dir}/box.service" restart >> "$log_file" 2>&1
+  sleep 2
+
+  if [ ! -f "$state_file" ]; then
+    network_signature > "$state_file"
+  fi
+
+  rmdir "$lock_dir" 2>/dev/null
+}
+
+last=""
+[ -f "$state_file" ] && last=$(cat "$state_file" 2>/dev/null)
+
+while [ -f "/data/adb/box/run/box.pid" ]; do
+  current=$(network_signature)
+
+  if [ -z "$last" ]; then
+    last="$current"
+    echo "$current" > "$state_file"
+  elif [ -n "$current" ] && [ "$current" != "$last" ]; then
+    echo "$current" > "$state_file"
+    last="$current"
+    recover
+  elif ! tun_alive; then
+    echo "$(date): proxy TUN device missing, restarting proxy service" >> "$log_file"
+    recover
+    last=$(network_signature)
+    echo "$last" > "$state_file"
+  fi
+
+  sleep 5
+done
+
+rm -f "$state_file"
