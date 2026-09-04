@@ -1,0 +1,7 @@
+id=box_network_debug_patch
+name=Box Network Debug Patch
+version=1.0
+versionCode=1
+author=microllate
+license=GPL-3.0
+description=Diagnostic patch for Box for Root: resilient network event logging and network watchdog snapshots. No automatic restart.
