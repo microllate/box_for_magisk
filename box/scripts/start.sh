@@ -57,12 +57,10 @@ net_inotifyd() {
   # - Here we monitor /data/misc/net and /data/misc/net/rt_tables
   #   because they reflect changes in routing tables and interfaces.
 
-  # Wait until at least one of the target files/directories exists
   while [ ! -f "$ctr_dir" ] && [ ! -f "$net_dir" ]; do
-      sleep 3
+    sleep 3
   done
 
-  # Launch inotifyd handlers in the background
   inotifyd "${scripts_dir}/ctr.inotify" "$ctr_dir" >/dev/null 2>&1 &
   inotifyd "${scripts_dir}/net.inotify" "$net_dir" >/dev/null 2>&1 &
 }
@@ -73,18 +71,26 @@ start_inotifyd() {
     if grep -q -e "box.inotify" -e "net.inotify" "/proc/$PID/cmdline"; then
       kill -9 "$PID"
     fi
-    # if grep -q "box.inotify" "/proc/$PID/cmdline"; then
-      # kill -9 "$PID"
-    # fi
   done
   inotifyd "${scripts_dir}/box.inotify" "${moddir}" > "/dev/null" 2>&1 &
   net_inotifyd
 }
 
+start_network_watchdog() {
+  # Kill only an older watchdog belonging to this module.
+  PIDs=($($busybox pidof sh))
+  for PID in "${PIDs[@]}"; do
+    if grep -q "net.watchdog" "/proc/$PID/cmdline" 2>/dev/null; then
+      kill -9 "$PID"
+    fi
+  done
+  /system/bin/sh "${scripts_dir}/net.watchdog" >/dev/null 2>&1 &
+}
+
 mkdir -p /data/adb/box/run/
 if [ -f "/data/adb/box/manual" ]; then
   if [ -f "/data/adb/box/run/box.pid" ]; then
-      rm -rf /data/adb/box/run/box.pid
+    rm -rf /data/adb/box/run/box.pid
   fi
   net_inotifyd
   exit 1
@@ -98,3 +104,4 @@ if [ -f "$file_settings" ] && [ -r "$file_settings" ] && [ -s "$file_settings" ]
 fi
 
 start_inotifyd
+start_network_watchdog
