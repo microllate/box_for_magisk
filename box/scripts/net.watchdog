@@ -32,6 +32,11 @@ default_gateway() {
     | busybox awk '{for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}'
 }
 
+default_source() {
+  ip -4 route get 1.1.1.1 2>/dev/null \
+    | busybox awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}'
+}
+
 tun_alive() {
   case "${network_mode}" in
     tun|mixed)
@@ -58,15 +63,20 @@ tun_alive() {
 health_probe() {
   local iface="$1"
   local gateway="$2"
+  local source="$3"
 
-  # First check the cellular/Wi-Fi next hop, then a public IP over the same
-  # physical interface. This is diagnostic only; it never changes routing.
+  # First check the physical next hop, then test TCP/ICMP reachability from
+  # the physical source address. This is diagnostic only and never changes
+  # routing or proxy state.
   if [ -n "$gateway" ] && [ -n "$iface" ]; then
     busybox ping -I "$iface" -c 1 -W 2 "$gateway" >/dev/null 2>&1 || return 10
   fi
 
+  if [ -n "$source" ]; then
+    busybox nc -s "$source" -w 3 1.1.1.1 443 >/dev/null 2>&1 && return 0
+  fi
+
   if [ -n "$iface" ]; then
-    busybox nc -s 0.0.0.0 -w 3 "$iface" 1.1.1.1 443 >/dev/null 2>&1 && return 0
     busybox ping -I "$iface" -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && return 0
   fi
 
@@ -125,12 +135,15 @@ capture_snapshot() {
     echo "===== health probe ====="
     iface=$(default_interface)
     gateway=$(default_gateway)
+    source=$(default_source)
     echo "interface=${iface}"
     echo "gateway=${gateway}"
-    if health_probe "$iface" "$gateway"; then
+    echo "source=${source}"
+    if health_probe "$iface" "$gateway" "$source"; then
       echo "probe=OK"
     else
-      echo "probe=FAIL rc=$?"
+      rc=$?
+      echo "probe=FAIL rc=${rc}"
     fi
   } > "${dir}/snapshot.log" 2>&1
 
@@ -144,7 +157,7 @@ capture_snapshot() {
 
 last=""
 fail_count=0
-last_health_log=0
+last_health_check=0
 
 [ -f "$state_file" ] && last=$(cat "$state_file" 2>/dev/null)
 
@@ -152,6 +165,7 @@ while [ -f "${run_dir}/box.pid" ]; do
   current=$(network_signature)
   iface=$(default_interface)
   gateway=$(default_gateway)
+  source=$(default_source)
   now=$(date +%s)
 
   if [ -z "$last" ]; then
@@ -172,14 +186,14 @@ while [ -f "${run_dir}/box.pid" ]; do
 
   # Run a lightweight direct-link probe every 10 seconds. Two consecutive
   # failures trigger a snapshot; no restart or routing change is performed.
-  if [ $((now - last_health_log)) -ge 10 ]; then
-    last_health_log="$now"
-    if health_probe "$iface" "$gateway"; then
+  if [ $((now - last_health_check)) -ge 10 ]; then
+    last_health_check="$now"
+    if health_probe "$iface" "$gateway" "$source"; then
       fail_count=0
-      echo "$(date): direct network probe OK iface=${iface} gateway=${gateway}" >> "$log_file"
+      echo "$(date): direct network probe OK iface=${iface} gateway=${gateway} source=${source}" >> "$log_file"
     else
       fail_count=$((fail_count + 1))
-      echo "$(date): direct network probe FAILED (${fail_count}/2) iface=${iface} gateway=${gateway}" >> "$log_file"
+      echo "$(date): direct network probe FAILED (${fail_count}/2) iface=${iface} gateway=${gateway} source=${source}" >> "$log_file"
       if [ "$fail_count" -ge 2 ]; then
         capture_snapshot "health-failure"
         fail_count=0
