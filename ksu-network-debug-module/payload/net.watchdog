@@ -1,0 +1,201 @@
+#!/system/bin/sh
+
+export PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH:/system/bin"
+
+scripts_dir="${0%/*}"
+run_dir="/data/adb/box/run"
+settings="/data/adb/box/settings.ini"
+state_file="${run_dir}/network.state"
+log_file="${run_dir}/network-watchdog.log"
+debug_dir="${run_dir}/network-debug"
+
+[ -f "$settings" ] || exit 0
+. "$settings"
+
+mkdir -p "$debug_dir" >/dev/null 2>&1 || exit 0
+
+network_signature() {
+  {
+    ip -4 route show default 2>/dev/null
+    ip -4 route get 1.1.1.1 2>/dev/null
+    ip -4 addr show scope global 2>/dev/null
+  } | busybox sed '/^$/d' | busybox sha256sum | busybox awk '{print $1}'
+}
+
+default_interface() {
+  ip -4 route get 1.1.1.1 2>/dev/null \
+    | busybox awk '{for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}'
+}
+
+default_gateway() {
+  ip -4 route get 1.1.1.1 2>/dev/null \
+    | busybox awk '{for (i=1; i<=NF; i++) if ($i == "via") {print $(i+1); exit}}'
+}
+
+default_source() {
+  ip -4 route get 1.1.1.1 2>/dev/null \
+    | busybox awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}'
+}
+
+tun_alive() {
+  case "${network_mode}" in
+    tun|mixed)
+      case "${bin_name}" in
+        clash)
+          device=$(busybox awk '!/^ *#/ && /device:/ {sub(/^[^:]*:[[:space:]]*/, ""); print $1; exit}' "${clash_config}" 2>/dev/null)
+          busybox ifconfig "${device:-meta}" >/dev/null 2>&1
+          ;;
+        sing-box)
+          device=$(find "${box_dir}/sing-box/" -maxdepth 1 -type f -name '*.json' -exec busybox grep -oE '"interface_name"[[:space:]]*:[[:space:]]*"[^"]*' {} + 2>/dev/null | busybox awk -F'"' '{print $4}' | head -n 1)
+          busybox ifconfig "${device:-tun0}" >/dev/null 2>&1
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+health_probe() {
+  local iface="$1"
+  local gateway="$2"
+  local source="$3"
+
+  if [ -n "$gateway" ] && [ -n "$iface" ]; then
+    busybox ping -I "$iface" -c 1 -W 2 "$gateway" >/dev/null 2>&1 || return 10
+  fi
+
+  if [ -n "$source" ]; then
+    busybox nc -s "$source" -w 3 1.1.1.1 443 >/dev/null 2>&1 && return 0
+  fi
+
+  if [ -n "$iface" ]; then
+    busybox ping -I "$iface" -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && return 0
+  fi
+
+  return 20
+}
+
+capture_snapshot() {
+  local reason="$1"
+  local stamp
+  local dir
+
+  stamp=$(date +%Y%m%d_%H%M%S)
+  dir="${debug_dir}/${stamp}_${reason}"
+  mkdir -p "$dir" >/dev/null 2>&1 || return 0
+
+  {
+    echo "===== time ====="
+    date
+    echo
+    echo "===== reason ====="
+    echo "$reason"
+    echo
+    echo "===== settings ====="
+    grep -E '^(bin_name|network_mode|ipv6|tproxy_port|redir_port|xclash_option)=' "$settings" 2>/dev/null
+    echo
+    echo "===== process ====="
+    pidof clash 2>/dev/null || true
+    pidof mihomo 2>/dev/null || true
+    pidof sing-box 2>/dev/null || true
+    cat "${run_dir}/box.pid" 2>/dev/null || true
+    echo
+    echo "===== interfaces ====="
+    ip addr 2>&1
+    echo
+    echo "===== routes ====="
+    ip -4 route show table all 2>&1
+    echo
+    echo "===== rules ====="
+    ip rule 2>&1
+    echo
+    echo "===== dns properties ====="
+    getprop 2>&1 | grep -iE '(^|\.)dns|net\.dns' || true
+    echo
+    echo "===== connectivity ====="
+    dumpsys connectivity 2>&1
+    echo
+    echo "===== tun ====="
+    ifconfig meta 2>&1 || true
+    echo
+    echo "===== mangle ====="
+    iptables -t mangle -L -n -v 2>&1
+    echo
+    echo "===== nat ====="
+    iptables -t nat -L -n -v 2>&1
+    echo
+    echo "===== health probe ====="
+    iface=$(default_interface)
+    gateway=$(default_gateway)
+    source=$(default_source)
+    echo "interface=${iface}"
+    echo "gateway=${gateway}"
+    echo "source=${source}"
+    if health_probe "$iface" "$gateway" "$source"; then
+      echo "probe=OK"
+    else
+      rc=$?
+      echo "probe=FAIL rc=${rc}"
+    fi
+  } > "${dir}/snapshot.log" 2>&1
+
+  busybox ls -1dt "${debug_dir}"/* 2>/dev/null \
+    | busybox tail -n +6 \
+    | busybox xargs -r busybox rm -rf
+
+  echo "$(date): captured ${dir}" >> "$log_file"
+}
+
+last=""
+fail_count=0
+last_health_check=0
+
+[ -f "$state_file" ] && last=$(cat "$state_file" 2>/dev/null)
+
+while [ -f "${run_dir}/box.pid" ]; do
+  current=$(network_signature)
+  iface=$(default_interface)
+  gateway=$(default_gateway)
+  source=$(default_source)
+  now=$(date +%s)
+
+  if [ -z "$last" ]; then
+    last="$current"
+    echo "$current" > "$state_file"
+  elif [ -n "$current" ] && [ "$current" != "$last" ]; then
+    echo "$(date): network signature changed" >> "$log_file"
+    echo "$current" > "$state_file"
+    last="$current"
+    capture_snapshot "network-change"
+    fail_count=0
+  fi
+
+  if ! tun_alive; then
+    echo "$(date): proxy TUN device missing" >> "$log_file"
+    capture_snapshot "tun-missing"
+  fi
+
+  if [ $((now - last_health_check)) -ge 10 ]; then
+    last_health_check="$now"
+    if health_probe "$iface" "$gateway" "$source"; then
+      fail_count=0
+      echo "$(date): direct network probe OK iface=${iface} gateway=${gateway} source=${source}" >> "$log_file"
+    else
+      fail_count=$((fail_count + 1))
+      echo "$(date): direct network probe FAILED (${fail_count}/2) iface=${iface} gateway=${gateway} source=${source}" >> "$log_file"
+      if [ "$fail_count" -ge 2 ]; then
+        capture_snapshot "health-failure"
+        fail_count=0
+      fi
+    fi
+  fi
+
+  sleep 5
+done
+
+rm -f "$state_file"
